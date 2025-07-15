@@ -8,10 +8,10 @@ from trl import SFTConfig, SFTTrainer
 from peft import PeftModel
 
 BASE_MODEL = "google/gemma-3-4b-it"
-ROW_NUMBER = 50000 #use none for full set
-USE_4BIT_QUANTIZATION = True
-PER_DEVICE_TRAIN_BATCH_SIZE = 8
-GRADIENT_ACC_STEPS = 2
+ROW_NUMBER = 10000 #use none for full set
+USE_4BIT_QUANTIZATION = False
+PER_DEVICE_TRAIN_BATCH_SIZE = 1
+GRADIENT_ACC_STEPS = 4
 
 if ROW_NUMBER is not None:
     RUN_NAME = BASE_MODEL + "-" + str(ROW_NUMBER)
@@ -183,7 +183,7 @@ def collate_fn(examples):
             example["messages"], add_generation_prompt=False, tokenize=False
         )
         texts.append(text.strip())
-        images.append(image_inputs)
+        images.append(image_inputs[0])
 
     # Tokenize the texts and process the images
     batch = processor(text=texts, images=images, return_tensors="pt", padding=True)
