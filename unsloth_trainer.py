@@ -5,10 +5,10 @@ from tqdm import tqdm
 from PIL import Image
 import wandb
 
-BASE_MODEL = "google/gemma-3-4b-it"
-ROW_NUMBER = 10000 #use none for full set
+BASE_MODEL = "google/gemma-3-4b-it-unsloth"
+ROW_NUMBER = 20000 #use none for full set
 USE_4BIT_QUANTIZATION = False
-PER_DEVICE_TRAIN_BATCH_SIZE = 1
+PER_DEVICE_TRAIN_BATCH_SIZE = 32
 GRADIENT_ACC_STEPS = 4
 
 if ROW_NUMBER is not None:
@@ -53,7 +53,6 @@ model = FastVisionModel.get_peft_model(
     target_modules = "all-linear",    # Optional now! Can specify a list if needed
     modules_to_save=[
         "lm_head",
-        "embed_tokens",
     ],
 )
 
@@ -98,16 +97,15 @@ trainer = SFTTrainer(
     processing_class=processor.tokenizer,
     data_collator=UnslothVisionDataCollator(model, processor),
     args = SFTConfig(
-        per_device_train_batch_size = 1,
-        gradient_accumulation_steps = 4,
+        per_device_train_batch_size = PER_DEVICE_TRAIN_BATCH_SIZE,
+        gradient_accumulation_steps = GRADIENT_ACC_STEPS,
         gradient_checkpointing = True,
 
         # use reentrant checkpointing
         gradient_checkpointing_kwargs = {"use_reentrant": False},
         max_grad_norm = 0.3,              # max gradient norm based on QLoRA paper
         warmup_ratio = 0.03,
-        max_steps = 30,
-        #num_train_epochs = 2,          # Set this instead of max_steps for full training runs
+        num_train_epochs = 1,         # Set this instead of max_steps for full training runs
         learning_rate = 2e-4,
         logging_steps = 1,
         save_strategy="steps",
@@ -122,7 +120,7 @@ trainer = SFTTrainer(
         remove_unused_columns = False,
         dataset_text_field = "",
         dataset_kwargs = {"skip_prepare_dataset": True},
-        max_seq_length = None,
+        max_seq_length = 4096,
     )
 )
 
