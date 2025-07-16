@@ -4,10 +4,11 @@ import json
 from tqdm import tqdm
 from PIL import Image
 import wandb
+from torch.utils.data import Dataset
+from unsloth import get_chat_template
 
 BASE_MODEL = "google/gemma-3-4b-it-unsloth"
-ROW_NUMBER = 20000 #use none for full set
-USE_4BIT_QUANTIZATION = False
+ROW_NUMBER = None
 PER_DEVICE_TRAIN_BATCH_SIZE = 32
 GRADIENT_ACC_STEPS = 4
 
@@ -56,30 +57,34 @@ model = FastVisionModel.get_peft_model(
     ],
 )
 
-with open("chart2code_160k.json", "r") as f:
-    dataset = json.load(f)
+class Chart2CodeDataset(Dataset):
+    def __init__(self, json_path, row_number=None):
+        with open(json_path, "r") as f:
+            self.samples = json.load(f)
+        if row_number is not None:
+            self.samples = self.samples[:row_number]
+        self.instruction = "You are an expert developer specializing in writing Python matplotlib code based on a given picture. I need your help to generate the Python code that can reproduce the picture based on the picture I provided.\nTo ensure accuracy and detail in your recreation, you need to begin with a comprehensive analysis of the figure.    You should generate code snippets with the following steps\n1.Layout and Chart Type Analysis: e.g., identify the picture’s composition, noting the presence,arrangement of any subplots and how many charts are within a subplot.\n2.Data Analysis: e.g., summarize the data trend or pattern.\n3.Additional Features: e.g., identify any supplementary elements such as legends, colormaps, tick labels, or text annotations that contribute to the figure’s clarity or aesthetic appeal.\n4.Then generate the final code according to the previous analysis."
 
-dataset = dataset[:ROW_NUMBER] if ROW_NUMBER is not None else dataset
+    def __len__(self):
+        return len(self.samples)
 
-instruction = "You are an expert developer specializing in writing Python matplotlib code based on a given picture. I need your help to generate the Python code that can reproduce the picture based on the picture I provided.\nTo ensure accuracy and detail in your recreation, you need to begin with a comprehensive analysis of the figure.    You should generate code snippets with the following steps\n1.Layout and Chart Type Analysis: e.g., identify the picture’s composition, noting the presence,arrangement of any subplots and how many charts are within a subplot.\n2.Data Analysis: e.g., summarize the data trend or pattern.\n3.Additional Features: e.g., identify any supplementary elements such as legends, colormaps, tick labels, or text annotations that contribute to the figure’s clarity or aesthetic appeal.\n4.Then generate the final code according to the previous analysis."
+    def __getitem__(self, idx):
+        sample = self.samples[idx]
+        conversation = [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": self.instruction},
+                    {"type": "image", "image": Image.open(sample["image"]).convert("RGB")},
+                ],
+            },
+            {"role": "assistant", "content": [{"type": "text", "text": sample["conversations"][1]["value"]}]},
+        ]
+        return {"messages": conversation}
 
-def convert_to_conversation(sample):
-    conversation = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": instruction},
-                {"type": "image", "image": Image.open(sample["image"]).convert("RGB")},
-            ],
-        },
-        {"role": "assistant", "content": [{"type": "text", "text": sample["conversations"][1]["value"]}]},
-    ]
-    return {"messages": conversation}
-pass
+converted_dataset = Chart2CodeDataset("chart2code_160k.json", ROW_NUMBER)
 
-converted_dataset = [convert_to_conversation(sample) for sample in tqdm(dataset)]
 
-from unsloth import get_chat_template
 
 processor = get_chat_template(
     processor,
