@@ -6,6 +6,10 @@ from PIL import Image
 import wandb
 from torch.utils.data import Dataset
 from unsloth import get_chat_template
+import os
+from unsloth.trainer import UnslothVisionDataCollator
+from trl import SFTTrainer, SFTConfig
+
 
 BASE_MODEL = "google/gemma-3-4b-it-unsloth"
 ROW_NUMBER = None
@@ -16,20 +20,6 @@ if ROW_NUMBER is not None:
     RUN_NAME = BASE_MODEL + "-" + str(ROW_NUMBER)
 else:
     RUN_NAME = BASE_MODEL + "-full"
-
-wandb.init(
-    project="gemma-chart2code-lora",  # Name your project
-    name=RUN_NAME,  # Name this specific run
-    config={
-        "model": BASE_MODEL,
-        "dataset": "chart2code_160k",
-        "epochs": 1,
-        "batch_size": PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACC_STEPS,
-        "learning_rate": 2e-4,
-        "lora_r": 16,
-        "lora_alpha": 16,
-    }
-)
 
 model, processor = FastVisionModel.from_pretrained(
     "unsloth/gemma-3-4b-it",
@@ -60,25 +50,58 @@ model = FastVisionModel.get_peft_model(
 class Chart2CodeDataset(Dataset):
     def __init__(self, json_path, row_number=None):
         with open(json_path, "r") as f:
-            self.samples = json.load(f)
+            raw_samples = json.load(f)
+
         if row_number is not None:
-            self.samples = self.samples[:row_number]
-        self.instruction = "You are an expert developer specializing in writing Python matplotlib code based on a given picture. I need your help to generate the Python code that can reproduce the picture based on the picture I provided.\nTo ensure accuracy and detail in your recreation, you need to begin with a comprehensive analysis of the figure.    You should generate code snippets with the following steps\n1.Layout and Chart Type Analysis: e.g., identify the picture’s composition, noting the presence,arrangement of any subplots and how many charts are within a subplot.\n2.Data Analysis: e.g., summarize the data trend or pattern.\n3.Additional Features: e.g., identify any supplementary elements such as legends, colormaps, tick labels, or text annotations that contribute to the figure’s clarity or aesthetic appeal.\n4.Then generate the final code according to the previous analysis."
+            raw_samples = raw_samples[:row_number]
+
+        self.instruction = (
+            "You are an expert developer specializing in writing Python matplotlib code based on a given picture. "
+            "I need your help to generate the Python code that can reproduce the picture based on the picture I provided.\n"
+            "To ensure accuracy and detail in your recreation, you need to begin with a comprehensive analysis of the figure.\n"
+            "You should generate code snippets with the following steps:\n"
+            "1. Layout and Chart Type Analysis\n"
+            "2. Data Analysis\n"
+            "3. Additional Features\n"
+            "4. Then generate the final code according to the previous analysis."
+        )
+
+        # 🔍 Filtrer uniquement les images valides (ne pas tout charger)
+        self.samples = []
+        for sample in tqdm(raw_samples):
+            image_path = sample.get("image")
+            if not image_path or not os.path.exists(image_path):
+                continue
+            try:
+                with Image.open(image_path) as im:
+                    im.verify()  # Vérifie la validité du fichier image
+                self.samples.append(sample)
+            except (UnidentifiedImageError, OSError):
+                continue
 
     def __len__(self):
         return len(self.samples)
 
     def __getitem__(self, idx):
         sample = self.samples[idx]
+        try:
+            image = Image.open(sample["image"]).convert("RGB")
+        except Exception as e:
+            # Cela ne devrait pas arriver si __init__ a bien filtré, mais par précaution :
+            return self.__getitem__((idx + 1) % len(self))
+        
         conversation = [
             {
                 "role": "user",
                 "content": [
                     {"type": "text", "text": self.instruction},
-                    {"type": "image", "image": Image.open(sample["image"]).convert("RGB")},
+                    {"type": "image", "image": image},
                 ],
             },
-            {"role": "assistant", "content": [{"type": "text", "text": sample["conversations"][1]["value"]}]},
+            {
+                "role": "assistant",
+                "content": [{"type": "text", "text": sample["conversations"][1]["value"]}],
+            },
         ]
         return {"messages": conversation}
 
@@ -91,10 +114,22 @@ processor = get_chat_template(
     "gemma-3"
 )
 
-from unsloth.trainer import UnslothVisionDataCollator
-from trl import SFTTrainer, SFTConfig
 
 FastVisionModel.for_training(model) # Enable for training!
+
+wandb.init(
+    project="gemma-chart2code-lora",  # Name your project
+    name=RUN_NAME,  # Name this specific run
+    config={
+        "model": BASE_MODEL,
+        "dataset": "chart2code_160k",
+        "epochs": 1,
+        "batch_size": PER_DEVICE_TRAIN_BATCH_SIZE * GRADIENT_ACC_STEPS,
+        "learning_rate": 2e-4,
+        "lora_r": 16,
+        "lora_alpha": 16,
+    }
+)
 
 trainer = SFTTrainer(
     model=model,
