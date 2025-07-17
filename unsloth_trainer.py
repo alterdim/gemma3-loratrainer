@@ -2,7 +2,7 @@ from unsloth import FastVisionModel # FastLanguageModel for LLMs
 from modelscope.msdatasets import MsDataset
 import json
 from tqdm import tqdm
-from PIL import Image
+from PIL import Image, UnidentifiedImageError
 import wandb
 from torch.utils.data import Dataset
 from unsloth import get_chat_template
@@ -13,13 +13,15 @@ from trl import SFTTrainer, SFTConfig
 
 BASE_MODEL = "google/gemma-3-4b-it-unsloth"
 ROW_NUMBER = None
-PER_DEVICE_TRAIN_BATCH_SIZE = 32
+PER_DEVICE_TRAIN_BATCH_SIZE = 4
 GRADIENT_ACC_STEPS = 4
 
 if ROW_NUMBER is not None:
     RUN_NAME = BASE_MODEL + "-" + str(ROW_NUMBER)
 else:
     RUN_NAME = BASE_MODEL + "-full"
+
+RUN_NAME = RUN_NAME + "-" + str(PER_DEVICE_TRAIN_BATCH_SIZE) + "x" + str(GRADIENT_ACC_STEPS)
 
 model, processor = FastVisionModel.from_pretrained(
     "unsloth/gemma-3-4b-it",
@@ -66,7 +68,6 @@ class Chart2CodeDataset(Dataset):
             "4. Then generate the final code according to the previous analysis."
         )
 
-        # 🔍 Filtrer uniquement les images valides (ne pas tout charger)
         self.samples = []
         for sample in tqdm(raw_samples):
             image_path = sample.get("image")
