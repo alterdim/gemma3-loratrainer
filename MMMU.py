@@ -59,7 +59,9 @@ for category in categories:
         img_1 = entry["image_1"]
         question = entry["question"]
         answers = entry["options"]
-        is_mcq = True if entry["question_type"] == "multiple_choice" else False
+        print(entry["question_type"])
+        is_mcq = True if entry["question_type"] == "multiple-choice" else False
+        print(is_mcq)
         try:
             prediction = gemma.infer(question, img_1, answers, is_mcq)
             with open("results.json", 'a') as out:

@@ -1,3 +1,7 @@
+import os
+os.environ['UNSLOTH_RETURN_LOGITS'] = '1'
+from unsloth.utils import patch_logits_output
+patch_logits_output(True)
 from unsloth import FastVisionModel # FastLanguageModel for LLMs
 from modelscope.msdatasets import MsDataset
 import json
@@ -6,22 +10,50 @@ from PIL import Image, UnidentifiedImageError
 import wandb
 from torch.utils.data import Dataset
 from unsloth import get_chat_template
-import os
 from unsloth.trainer import UnslothVisionDataCollator
 from trl import SFTTrainer, SFTConfig
+from transformers import PreTrainedTokenizer
+import torch
 
 
 BASE_MODEL = "google/gemma-3-4b-it-unsloth"
-ROW_NUMBER = None
+ROW_NUMBER = 1000
 PER_DEVICE_TRAIN_BATCH_SIZE = 4
 GRADIENT_ACC_STEPS = 4
+SEMANTIC_TOKEN_MULT = 3
+MAX_LENGTH = 4096
 
 if ROW_NUMBER is not None:
     RUN_NAME = BASE_MODEL + "-" + str(ROW_NUMBER)
 else:
     RUN_NAME = BASE_MODEL + "-full"
 
-RUN_NAME = RUN_NAME + "-" + str(PER_DEVICE_TRAIN_BATCH_SIZE) + "x" + str(GRADIENT_ACC_STEPS)
+RUN_NAME = RUN_NAME + "-customloss"
+
+
+
+class WeightedLossTrainer(SFTTrainer): 
+    def compute_loss(self, model, inputs, return_outputs=False, **kwargs): #kwargs necessary to avoid extra arguments being passed
+        loss_weights = inputs.pop("loss_weights", None)
+
+        outputs = model(**inputs)
+        logits = outputs.logits
+        labels = inputs["labels"]
+
+        ## LOSS OVERRIDE
+        import torch.nn.functional as F
+        loss = F.cross_entropy(
+            logits.view(-1, logits.size(-1)),
+            labels.view(-1),
+            reduction="none",
+        )
+
+        if loss_weights is not None:
+            ## flatten
+            loss = loss * loss_weights.view(-1)
+
+        loss = loss.mean()
+        return (loss, outputs) if return_outputs else loss
 
 model, processor = FastVisionModel.from_pretrained(
     "unsloth/gemma-3-4b-it",
@@ -48,6 +80,32 @@ model = FastVisionModel.get_peft_model(
         "lm_head",
     ],
 )
+
+class WeightedVisionDataCollator(UnslothVisionDataCollator):
+    def __call__(self, instances):
+        batch = super().__call__(instances)
+        tokenizer = self.processor.tokenizer
+
+        loss_weights_batch = []
+        for instance in instances:
+            code = instance["important_code"]
+            spans = instance["important_spans"]
+
+            tokenized = tokenizer(code, return_offsets_mapping=True, truncation=True, max_length=MAX_LENGTH)
+            weights = [1.0] * len(tokenized["input_ids"])
+
+            for i, (start, end) in enumerate(tokenized["offset_mapping"]):
+                for span_start, span_end in spans:
+                    if start >= span_start and end <= span_end:
+                        weights[i] = SEMANTIC_TOKEN_MULT  #MAGIC
+
+            weights += [1.0] * (MAX_LENGTH - len(weights))
+            weights = weights[:MAX_LENGTH]
+
+            loss_weights_batch.append(weights)
+
+        batch["loss_weights"] = torch.tensor(loss_weights_batch, dtype=torch.float32)
+        return batch
 
 class Chart2CodeDataset(Dataset):
     def __init__(self, json_path, row_number=None):
@@ -88,7 +146,7 @@ class Chart2CodeDataset(Dataset):
         try:
             image = Image.open(sample["image"]).convert("RGB")
         except Exception as e:
-            # Cela ne devrait pas arriver si __init__ a bien filtré, mais par précaution :
+        
             return self.__getitem__((idx + 1) % len(self))
         
         conversation = [
@@ -104,10 +162,26 @@ class Chart2CodeDataset(Dataset):
                 "content": [{"type": "text", "text": sample["conversations"][1]["value"]}],
             },
         ]
-        return {"messages": conversation}
+        assistant_code = sample["conversations"][1]["value"]
+        important_spans = find_important_spans(assistant_code)
+        return {
+            "messages": conversation,
+            "important_code": assistant_code,
+            "important_spans": important_spans,
+        }
 
 converted_dataset = Chart2CodeDataset("chart2code_160k.json", ROW_NUMBER)
 
+
+
+def find_important_spans(code: str):
+    import re
+    spans = []
+    for match in re.finditer(r"plt\.(plot|bar|scatter)\((.*?)\)", code):
+        spans.append(match.span(2))
+    for match in re.finditer(r"plt\.(title|xlabel|ylabel)\((.*?)\)", code):
+        spans.append(match.span(2))
+    return spans
 
 
 processor = get_chat_template(
@@ -116,11 +190,11 @@ processor = get_chat_template(
 )
 
 
-FastVisionModel.for_training(model) # Enable for training!
+FastVisionModel.for_training(model) 
 
 wandb.init(
-    project="gemma-chart2code-lora",  # Name your project
-    name=RUN_NAME,  # Name this specific run
+    project="gemma-chart2code-lora-newloss",
+    name=RUN_NAME,
     config={
         "model": BASE_MODEL,
         "dataset": "chart2code_160k",
@@ -132,11 +206,11 @@ wandb.init(
     }
 )
 
-trainer = SFTTrainer(
+trainer = WeightedLossTrainer(
     model=model,
     train_dataset=converted_dataset,
     processing_class=processor.tokenizer,
-    data_collator=UnslothVisionDataCollator(model, processor),
+    data_collator=WeightedVisionDataCollator(model, processor),
     args = SFTConfig(
         per_device_train_batch_size = PER_DEVICE_TRAIN_BATCH_SIZE,
         gradient_accumulation_steps = GRADIENT_ACC_STEPS,
@@ -144,9 +218,9 @@ trainer = SFTTrainer(
 
         # use reentrant checkpointing
         gradient_checkpointing_kwargs = {"use_reentrant": False},
-        max_grad_norm = 0.3,              # max gradient norm based on QLoRA paper
+        max_grad_norm = 0.3,        
         warmup_ratio = 0.03,
-        num_train_epochs = 1,         # Set this instead of max_steps for full training runs
+        num_train_epochs = 1,         
         learning_rate = 2e-4,
         logging_steps = 1,
         save_strategy="steps",
@@ -155,13 +229,13 @@ trainer = SFTTrainer(
         lr_scheduler_type = "cosine",
         seed = 3407,
         output_dir = "outputs",
-        report_to = "wandb",             # For Weights and Biases
+        report_to = "wandb", 
 
-        # You MUST put the below items for vision finetuning:
+        #VISION STUFF
         remove_unused_columns = False,
         dataset_text_field = "",
         dataset_kwargs = {"skip_prepare_dataset": True},
-        max_seq_length = 4096,
+        max_seq_length = MAX_LENGTH,
     )
 )
 
